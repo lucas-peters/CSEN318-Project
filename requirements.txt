@@ -1,0 +1,4 @@
+git+https://github.com/lucas-peters/SCALE-Sim.git@main
+numpy
+scipy
+matplotlib
