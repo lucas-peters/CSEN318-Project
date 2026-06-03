@@ -1,25 +1,31 @@
 """
 Die-to-die interconnect model.
 
-Models three topologies:
-  - Ring: unidirectional or bidirectional ring
-  - Mesh: 2D grid with nearest-neighbor links
-  - All-to-all: full crossbar (every chiplet has a direct link to every other)
+Models four topologies:
+  - Ring:         bidirectional ring, O(P) links
+  - Mesh:         2-D grid with nearest-neighbour links, O(P) links
+  - All-to-all:   full crossbar, every chiplet has a direct link, O(P²) links
+  - Hierarchical: chiplets grouped into clusters; intra-cluster links are
+                  faster than inter-cluster links (models real chiplet packages
+                  such as AMD MI300X where chiplets share a local bus but reach
+                  remote chiplets over a slower die-to-die fabric)
 
-Each topology is parameterized by:
-  - num_chiplets: number of nodes
-  - link_bw: bandwidth per link in bytes/cycle
-  - link_latency: per-hop latency in cycles
+Each topology is parameterised by:
+  - num_chiplets:   number of nodes
+  - link_bw:        bandwidth per link in bytes/cycle
+  - link_latency:   per-hop latency in cycles
 
-Supports standard collective operations:
-  - broadcast: one node sends data to all others
-  - scatter: one node sends distinct chunks to each other node
-  - gather: all nodes send distinct chunks to one node
-  - allreduce: all nodes contribute partial sums, all receive the result
+Hierarchical-only parameters:
+  - cluster_size:        chiplets per cluster (default: isqrt(P))
+  - intra_bw_factor:     link_bw multiplier for intra-cluster links (default 2.0)
+  - intra_latency_factor: link_latency multiplier for intra-cluster (default 0.5)
 
-Transfer times include serialization delay (data_size / link_bw) and
-multi-hop latency where applicable. Contention is modeled as serialized
-access on shared links.
+Supported collectives:
+  broadcast  – one node → all others (identical data)
+  scatter    – one node → each other node (distinct chunks)
+  allreduce  – partial sums from all nodes → fully reduced result at all nodes
+
+Transfer times include serialisation delay (bytes / bw) and multi-hop latency.
 """
 
 import math
@@ -28,16 +34,17 @@ from enum import Enum
 
 
 class Topology(Enum):
-    RING = "ring"
-    MESH = "mesh"
-    ALL_TO_ALL = "all_to_all"
+    RING         = "ring"
+    MESH         = "mesh"
+    ALL_TO_ALL   = "all_to_all"
+    HIERARCHICAL = "hierarchical"
 
 
 @dataclass
 class TransferResult:
     cycles: int
     data_bytes: int
-    effective_bw: float  # bytes/cycle achieved
+    effective_bw: float   # bytes/cycle achieved
     description: str
 
 
@@ -47,14 +54,24 @@ class Interconnect:
                  topology: Topology,
                  link_bw: float,
                  link_latency: int = 10,
-                 element_bytes: int = 2):
+                 element_bytes: int = 2,
+                 # ── hierarchical parameters ───────────────────────────
+                 cluster_size: int = None,
+                 intra_bw_factor: float = 2.0,
+                 intra_latency_factor: float = 0.5):
         """
         Args:
-            num_chiplets: number of chiplets in the system
-            topology: ring, mesh, or all_to_all
-            link_bw: bytes per cycle per link
-            link_latency: fixed per-hop latency in cycles
-            element_bytes: bytes per data element (2 for fp16, 4 for fp32)
+            num_chiplets:        total number of chiplets
+            topology:            ring | mesh | all_to_all | hierarchical
+            link_bw:             bytes per cycle per link (inter-cluster bw
+                                 for hierarchical)
+            link_latency:        fixed per-hop latency in cycles (inter-cluster
+                                 latency for hierarchical)
+            element_bytes:       bytes per data element (2 = fp16, 4 = fp32)
+            cluster_size:        chiplets per cluster for hierarchical topology;
+                                 defaults to isqrt(num_chiplets)
+            intra_bw_factor:     intra-cluster bandwidth = link_bw × factor
+            intra_latency_factor: intra-cluster latency  = link_latency × factor
         """
         self.P = num_chiplets
         self.topology = topology
@@ -65,16 +82,29 @@ class Interconnect:
         if topology == Topology.MESH:
             self.mesh_dim = math.isqrt(num_chiplets)
             if self.mesh_dim * self.mesh_dim != num_chiplets:
-                # Find closest rectangular mesh
                 self.mesh_rows = self.mesh_dim
                 self.mesh_cols = math.ceil(num_chiplets / self.mesh_dim)
             else:
                 self.mesh_rows = self.mesh_dim
                 self.mesh_cols = self.mesh_dim
 
-    def _serial_time(self, data_bytes: int) -> float:
-        """Time to push data_bytes through a single link."""
-        return data_bytes / self.link_bw
+        elif topology == Topology.HIERARCHICAL:
+            if cluster_size is None:
+                cluster_size = max(2, math.isqrt(num_chiplets))
+            self.cluster_size = cluster_size
+            self.num_clusters = math.ceil(num_chiplets / cluster_size)
+            # intra-cluster links are shorter → higher bandwidth, lower latency
+            self.intra_bw      = link_bw * intra_bw_factor
+            self.inter_bw      = link_bw
+            self.intra_latency = max(1, int(link_latency * intra_latency_factor))
+            self.inter_latency = link_latency
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _serial(self, data_bytes: float, bw: float) -> float:
+        return data_bytes / bw
+
+    # ── collectives ───────────────────────────────────────────────────────────
 
     def broadcast(self, num_elements: int) -> TransferResult:
         """One node sends identical data to all other nodes."""
@@ -82,36 +112,41 @@ class Interconnect:
         P = self.P
 
         if P <= 1:
-            return TransferResult(0, 0, 0, "single chiplet, no transfer")
+            return TransferResult(0, 0, 0.0, "single chiplet, no transfer")
 
         if self.topology == Topology.ALL_TO_ALL:
-            # Direct link to every node, all transfers happen in parallel
-            cycles = self._serial_time(data_bytes) + self.link_latency
+            # Direct link to every node; all transfers in parallel
+            cycles = self._serial(data_bytes, self.link_bw) + self.link_latency
 
         elif self.topology == Topology.RING:
-            # Pipelined broadcast around the ring.
-            # Split data into P-1 chunks, pipeline around.
-            # Time = (P-1) * (chunk_size/bw + latency)
-            # With large data, serialization dominates:
-            # Total ~= data_bytes/bw + (P-1)*latency
-            # But without pipelining (store-and-forward):
-            # Total = (P-1) * (data_bytes/bw + latency)
-            # Use the pipelined model since it's standard.
-            chunk = data_bytes / (P - 1) if P > 1 else data_bytes
-            cycles = (self._serial_time(chunk) + self.link_latency) * (P - 1)
+            # Pipelined ring broadcast: split into (P-1) chunks
+            chunk = data_bytes / (P - 1)
+            cycles = (self._serial(chunk, self.link_bw) + self.link_latency) * (P - 1)
 
         elif self.topology == Topology.MESH:
-            # Spanning tree broadcast on mesh.
-            # Diameter = (mesh_rows - 1) + (mesh_cols - 1)
-            # Store-and-forward at each hop.
+            # Spanning-tree broadcast on mesh (store-and-forward)
             diameter = (self.mesh_rows - 1) + (self.mesh_cols - 1)
-            cycles = diameter * (self._serial_time(data_bytes) + self.link_latency)
+            cycles = diameter * (self._serial(data_bytes, self.link_bw) + self.link_latency)
+
+        elif self.topology == Topology.HIERARCHICAL:
+            # Phase 1: source broadcasts to all other cluster leaders (inter)
+            nc = self.num_clusters
+            chunk_inter = data_bytes / max(nc - 1, 1)
+            inter_cycles = (self._serial(chunk_inter, self.inter_bw)
+                            + self.inter_latency) * (nc - 1)
+            # Phase 2: each leader broadcasts within its cluster (intra)
+            cs = self.cluster_size
+            chunk_intra = data_bytes / max(cs - 1, 1)
+            intra_cycles = (self._serial(chunk_intra, self.intra_bw)
+                            + self.intra_latency) * (cs - 1)
+            # Phases are pipelined: intra starts as soon as first chunk arrives
+            cycles = inter_cycles + intra_cycles
 
         else:
             raise ValueError(f"Unknown topology: {self.topology}")
 
         cycles = int(math.ceil(cycles))
-        eff_bw = data_bytes / cycles if cycles > 0 else 0
+        eff_bw = data_bytes / cycles if cycles > 0 else 0.0
         return TransferResult(cycles, data_bytes, eff_bw,
                               f"broadcast {num_elements} elements via {self.topology.value}")
 
@@ -119,80 +154,101 @@ class Interconnect:
         """One node sends a distinct chunk of total_elements/P to each other node."""
         P = self.P
         if P <= 1:
-            return TransferResult(0, 0, 0, "single chiplet")
+            return TransferResult(0, 0, 0.0, "single chiplet")
 
         chunk_elements = total_elements // P
         chunk_bytes = chunk_elements * self.element_bytes
-        data_bytes = chunk_bytes * (P - 1)  # total data moved
+        data_bytes = chunk_bytes * (P - 1)
 
         if self.topology == Topology.ALL_TO_ALL:
-            # All chunks sent in parallel
-            cycles = self._serial_time(chunk_bytes) + self.link_latency
+            cycles = self._serial(chunk_bytes, self.link_bw) + self.link_latency
 
         elif self.topology == Topology.RING:
-            # Each hop forwards (P-1-i) chunks at step i
-            # Total time = sum over i of (P-1-i)*chunk_bytes/bw + latency
-            # = chunk_bytes/bw * P*(P-1)/2 + (P-1)*latency
-            # Optimized scatter-reduce: (P-1) * (chunk_bytes/bw + latency)
-            cycles = (P - 1) * (self._serial_time(chunk_bytes) + self.link_latency)
+            cycles = (P - 1) * (self._serial(chunk_bytes, self.link_bw) + self.link_latency)
 
         elif self.topology == Topology.MESH:
             diameter = (self.mesh_rows - 1) + (self.mesh_cols - 1)
-            # Worst case: diameter hops, each forwarding a chunk
-            cycles = diameter * (self._serial_time(chunk_bytes) * P + self.link_latency)
+            cycles = diameter * (self._serial(chunk_bytes, self.link_bw) * P
+                                 + self.link_latency)
+
+        elif self.topology == Topology.HIERARCHICAL:
+            nc = self.num_clusters
+            cs = self.cluster_size
+            # Phase 1: scatter cluster-sized chunks to each cluster leader (inter)
+            cluster_chunk_bytes = chunk_bytes * cs
+            inter_cycles = (nc - 1) * (self._serial(cluster_chunk_bytes, self.inter_bw)
+                                       + self.inter_latency)
+            # Phase 2: each leader scatters within its cluster (intra)
+            intra_cycles = (cs - 1) * (self._serial(chunk_bytes, self.intra_bw)
+                                       + self.intra_latency)
+            cycles = inter_cycles + intra_cycles
+
+        else:
+            raise ValueError(f"Unknown topology: {self.topology}")
 
         cycles = int(math.ceil(cycles))
-        eff_bw = data_bytes / cycles if cycles > 0 else 0
+        eff_bw = data_bytes / cycles if cycles > 0 else 0.0
         return TransferResult(cycles, data_bytes, eff_bw,
                               f"scatter {total_elements} elements across {P} chiplets")
 
     def allreduce(self, num_elements: int) -> TransferResult:
         """
-        All chiplets contribute num_elements of partial sums.
-        All chiplets receive the fully reduced result.
+        All chiplets contribute partial sums; all receive the fully reduced result.
 
-        Uses ring allreduce where applicable:
-          Phase 1 (reduce-scatter): P-1 steps, each sending num_elements/P
-          Phase 2 (allgather): P-1 steps, each sending num_elements/P
-          Total data per link = 2 * (P-1)/P * num_elements
+        Ring allreduce (2-phase reduce-scatter + allgather):
+          Each phase: P-1 steps, each sending num_elements/P per step.
+          Total data per link = 2(P-1)/P × num_elements × element_bytes.
+
+        Hierarchical allreduce:
+          Phase 1 – ring allreduce within each cluster (intra links).
+          Phase 2 – ring allreduce across cluster representatives (inter links).
+          The two phases are sequential (cluster result must be ready before
+          inter-cluster reduction begins).
         """
         P = self.P
         data_bytes = num_elements * self.element_bytes
 
         if P <= 1:
-            return TransferResult(0, 0, 0, "single chiplet")
+            return TransferResult(0, 0, 0.0, "single chiplet")
 
         if self.topology == Topology.ALL_TO_ALL:
-            # Reduce to one node, broadcast back
-            # Each node sends data_bytes to root: serialized = data_bytes * (P-1) / bw
-            # But with all-to-all links, all sends are parallel
-            # Reduce: data_bytes/bw + latency
-            # Broadcast: data_bytes/bw + latency
-            cycles = 2 * (self._serial_time(data_bytes) + self.link_latency)
+            # Parallel reduce to root + broadcast: 2 × (data/bw + latency)
+            cycles = 2 * (self._serial(data_bytes, self.link_bw) + self.link_latency)
 
         elif self.topology == Topology.RING:
-            # Ring allreduce: optimal bandwidth utilization
             chunk_bytes = data_bytes / P
-            # Phase 1: reduce-scatter, P-1 steps
-            # Phase 2: allgather, P-1 steps
-            # Each step: chunk_bytes / bw + latency
             steps = 2 * (P - 1)
-            cycles = steps * (self._serial_time(chunk_bytes) + self.link_latency)
+            cycles = steps * (self._serial(chunk_bytes, self.link_bw) + self.link_latency)
 
         elif self.topology == Topology.MESH:
-            # Hierarchical: reduce along rows, then along cols, then broadcast back
-            # Row reduce: (mesh_cols - 1) steps
-            # Col reduce: (mesh_rows - 1) steps
-            # Reverse broadcast: same cost
+            # Hierarchical: reduce along rows then cols, broadcast back
             row_steps = self.mesh_cols - 1
             col_steps = self.mesh_rows - 1
             total_steps = 2 * (row_steps + col_steps)
             chunk_bytes = data_bytes / max(self.mesh_rows, self.mesh_cols)
-            cycles = total_steps * (self._serial_time(chunk_bytes) + self.link_latency)
+            cycles = total_steps * (self._serial(chunk_bytes, self.link_bw) + self.link_latency)
+
+        elif self.topology == Topology.HIERARCHICAL:
+            nc = self.num_clusters
+            cs = self.cluster_size
+            # Phase 1: ring allreduce within each cluster
+            chunk_intra = data_bytes / cs
+            steps_intra = 2 * (cs - 1)
+            intra_cycles = steps_intra * (self._serial(chunk_intra, self.intra_bw)
+                                          + self.intra_latency)
+            # Phase 2: ring allreduce across num_clusters representatives
+            chunk_inter = data_bytes / nc
+            steps_inter = 2 * (nc - 1)
+            inter_cycles = steps_inter * (self._serial(chunk_inter, self.inter_bw)
+                                          + self.inter_latency)
+            cycles = intra_cycles + inter_cycles
+
+        else:
+            raise ValueError(f"Unknown topology: {self.topology}")
 
         cycles = int(math.ceil(cycles))
         total_moved = int(2 * (P - 1) / P * data_bytes)
-        eff_bw = total_moved / cycles if cycles > 0 else 0
+        eff_bw = total_moved / cycles if cycles > 0 else 0.0
         return TransferResult(cycles, total_moved, eff_bw,
                               f"allreduce {num_elements} elements across {P} chiplets")
 
@@ -200,8 +256,69 @@ class Interconnect:
         """Direct transfer between two chiplets separated by `hops` links."""
         data_bytes = num_elements * self.element_bytes
         cycles = int(math.ceil(
-            hops * (self._serial_time(data_bytes) + self.link_latency)
+            hops * (self._serial(data_bytes, self.link_bw) + self.link_latency)
         ))
-        eff_bw = data_bytes / cycles if cycles > 0 else 0
+        eff_bw = data_bytes / cycles if cycles > 0 else 0.0
         return TransferResult(cycles, data_bytes, eff_bw,
                               f"p2p {num_elements} elements, {hops} hops")
+
+    # ── topology introspection ────────────────────────────────────────────────
+
+    def connection_info(self) -> dict:
+        """
+        Return topology connection statistics useful for fair cross-topology
+        comparisons.
+
+        Keys:
+          num_links          – number of bidirectional physical links
+          bisection_bandwidth – minimum bandwidth across any balanced partition
+                               of chiplets (bytes/cycle)
+          diameter           – maximum hop-distance between any two chiplets
+          avg_hops           – average hop-distance under uniform traffic
+          link_bw            – per-link bandwidth (bytes/cycle)
+          total_bandwidth    – num_links × link_bw (bytes/cycle)
+        """
+        P = self.P
+
+        if self.topology == Topology.RING:
+            num_links   = P                       # P bidirectional links
+            bisect_bw   = 2 * self.link_bw        # cut ring at 2 points
+            diameter    = P // 2
+            avg_hops    = P / 4.0
+
+        elif self.topology == Topology.MESH:
+            r, c = self.mesh_rows, self.mesh_cols
+            num_links   = r * (c - 1) + (r - 1) * c
+            bisect_bw   = min(r, c) * self.link_bw
+            diameter    = (r - 1) + (c - 1)
+            avg_hops    = ((r - 1) + (c - 1)) / 2.0
+
+        elif self.topology == Topology.ALL_TO_ALL:
+            num_links   = P * (P - 1) // 2
+            bisect_bw   = (P // 2) * (P // 2) * self.link_bw
+            diameter    = 1
+            avg_hops    = 1.0
+
+        elif self.topology == Topology.HIERARCHICAL:
+            cs = self.cluster_size
+            nc = self.num_clusters
+            # Intra-cluster: all-to-all within each cluster
+            intra_links = nc * (cs * (cs - 1) // 2)
+            # Inter-cluster: ring of cluster leaders
+            inter_links = nc
+            num_links   = intra_links + inter_links
+            bisect_bw   = self.inter_bw           # bottleneck is inter-cluster
+            diameter    = 1 + nc // 2             # 1 intra hop + inter-ring hops
+            avg_hops    = 1.0 + nc / 4.0
+
+        else:
+            raise ValueError(f"Unknown topology: {self.topology}")
+
+        return {
+            "num_links":           num_links,
+            "bisection_bandwidth": bisect_bw,
+            "diameter":            diameter,
+            "avg_hops":            avg_hops,
+            "link_bw":             self.link_bw,
+            "total_bandwidth":     num_links * self.link_bw,
+        }

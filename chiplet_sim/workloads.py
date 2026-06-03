@@ -102,6 +102,38 @@ def bert_attention_workloads(seq_len: int = 512) -> list[GEMMWorkload]:
 BERT_LAYERS = bert_attention_workloads(512)
 
 
+# ── BERT at seq_len = 2048 (matches the report table) ───────────────
+
+BERT_LAYERS_2048 = bert_attention_workloads(2048)
+
+
+# ── Exact workloads from the mid-project report table ────────────────
+# These five workloads are the primary targets for Experiments 1–4.
+# "ResNet conv3" (M=3136, N=256, K=576) is a custom variant: 56×56 spatial,
+# 3×3 filter with 64 input channels producing 256 output channels.
+
+REPORT_WORKLOADS = [
+    # ResNet-50 stages 1, 3, 5 (representative compute-bound ↔ comm-bound range)
+    GEMMWorkload("resnet50_conv1",         12544, 64,  147,
+                 "ResNet-50 conv1: 112×112, 7×7, 3→64ch"),
+    GEMMWorkload("resnet50_conv3",          3136, 256, 576,
+                 "ResNet-50 conv3: 56×56, 3×3, 64→256ch (custom)"),
+    GEMMWorkload("resnet50_conv5",            49, 512, 4608,
+                 "ResNet-50 conv5: 7×7, 3×3, 512→512ch"),
+    # BERT-Base attention (seq_len = 2048 as in the report table)
+    GEMMWorkload("bert_qk_seq2048",         2048, 2048, 64,
+                 "BERT Q×Kᵀ: seq=2048, d_head=64"),
+    GEMMWorkload("bert_qkv_proj_seq2048",   2048, 768, 768,
+                 "BERT QKV projection: seq=2048, 768→768"),
+]
+
+
+# ── All eight validation workloads (Experiment 5) ────────────────────
+# Five ResNet stages + three BERT attention ops at seq=2048.
+
+VALIDATION_WORKLOADS = RESNET50_REPRESENTATIVE + BERT_LAYERS_2048
+
+
 # ── All workloads for sweeps ──────────────────────────────────────────
 
 ALL_WORKLOADS = RESNET50_REPRESENTATIVE + BERT_LAYERS

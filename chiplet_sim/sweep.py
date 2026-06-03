@@ -20,7 +20,9 @@ from dataclasses import asdict
 from .compute import analytical_compute
 from .interconnect import Interconnect, Topology
 from .partition import evaluate_all_strategies, PartitionResult
-from .workloads import GEMMWorkload, ALL_WORKLOADS, RESNET50_REPRESENTATIVE, BERT_LAYERS
+from .compute import analytical_compute, scalesim_compute
+from .workloads import (GEMMWorkload, ALL_WORKLOADS, RESNET50_REPRESENTATIVE,
+                        BERT_LAYERS, REPORT_WORKLOADS, VALIDATION_WORKLOADS)
 
 
 SWEEP_CSV = "chiplet_sweep_results.csv"
@@ -223,3 +225,259 @@ def run_bandwidth_crossover_sweep(
                     csv.DictWriter(f, fieldnames=fields).writerow(row)
 
     log.info(f"Crossover sweep -> {output_csv}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Experiment 3: Partition strategy phase diagram
+# ─────────────────────────────────────────────────────────────────────────────
+
+PHASE_CSV = "phase_diagram_results.csv"
+
+PHASE_FIELDS = [
+    "workload", "m", "n", "k",
+    "num_chiplets", "link_bw",
+    "best_strategy", "speedup",
+    "compute_cycles", "distribute_cycles", "reduce_cycles",
+]
+
+
+def run_phase_diagram_sweep(
+        array_h: int = 128,
+        array_w: int = 128,
+        workloads: list = None,
+        chiplet_counts: list = None,
+        bandwidths: list = None,
+        link_latency: int = 10,
+        dataflow: str = "os",
+        output_csv: str = PHASE_CSV):
+    """
+    Experiment 3 sweep: for each (workload, P, B) cell on a ring topology
+    record the winning partition strategy and its speedup.
+
+    P sweeps every integer from 2 to 8 (not just powers of two) so that the
+    phase diagram has continuous coverage on the y-axis.
+    B sweeps 1–256 bytes/cycle on a log2 scale.
+    """
+    if workloads is None:
+        workloads = REPORT_WORKLOADS
+    if chiplet_counts is None:
+        chiplet_counts = list(range(2, 9))          # 2,3,4,5,6,7,8
+    if bandwidths is None:
+        bandwidths = [2**i for i in range(0, 9)]    # 1,2,4,...,256
+
+    log = logging.getLogger(__name__)
+    topo = Topology.RING
+
+    with open(output_csv, "w", newline="") as f:
+        csv.DictWriter(f, fieldnames=PHASE_FIELDS).writeheader()
+
+    for wl in workloads:
+        for P in chiplet_counts:
+            for bw in bandwidths:
+                ic = Interconnect(P, topo, bw, link_latency)
+                results = evaluate_all_strategies(
+                    wl.m, wl.n, wl.k, array_h, array_w, dataflow, P, ic
+                )
+                best = results[0]   # sorted by total_cycles_no_overlap
+                row = {
+                    "workload":           wl.name,
+                    "m": wl.m, "n": wl.n, "k": wl.k,
+                    "num_chiplets":       P,
+                    "link_bw":            bw,
+                    "best_strategy":      best.strategy,
+                    "speedup":            best.speedup_no_overlap,
+                    "compute_cycles":     best.compute.total_cycles,
+                    "distribute_cycles":  best.distribute.cycles,
+                    "reduce_cycles":      best.reduce.cycles,
+                }
+                with open(output_csv, "a", newline="") as f:
+                    csv.DictWriter(f, fieldnames=PHASE_FIELDS).writerow(row)
+
+    log.info(f"Phase diagram sweep -> {output_csv}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Experiment 4: Scaling efficiency
+# ─────────────────────────────────────────────────────────────────────────────
+
+SCALING_CSV = "scaling_results.csv"
+
+SCALING_FIELDS = [
+    "workload", "m", "n", "k",
+    "num_chiplets", "link_bw",
+    "best_strategy", "speedup", "efficiency",
+    "compute_cycles", "distribute_cycles", "reduce_cycles",
+    "total_cycles", "baseline_cycles",
+    "compute_fraction", "comm_fraction",
+]
+
+
+def run_scaling_sweep(
+        array_h: int = 128,
+        array_w: int = 128,
+        workloads: list = None,
+        chiplet_counts: list = None,
+        bandwidths: list = None,
+        link_latency: int = 10,
+        dataflow: str = "os",
+        output_csv: str = SCALING_CSV):
+    """
+    Experiment 4 sweep: best-strategy speedup and efficiency vs. chiplet count
+    at three fixed bandwidths (16, 64, 256 bytes/cycle).
+
+    P sweeps every integer 1–8 so the speedup curve is smooth.
+    Results include a compute/comm decomposition for each point.
+    """
+    if workloads is None:
+        workloads = REPORT_WORKLOADS
+    if chiplet_counts is None:
+        chiplet_counts = list(range(1, 9))      # 1,2,3,...,8
+    if bandwidths is None:
+        bandwidths = [16, 64, 256]
+
+    log = logging.getLogger(__name__)
+    topo = Topology.RING
+
+    with open(output_csv, "w", newline="") as f:
+        csv.DictWriter(f, fieldnames=SCALING_FIELDS).writeheader()
+
+    for wl in workloads:
+        baseline = analytical_compute(wl.m, wl.n, wl.k, array_h, array_w, dataflow)
+
+        for bw in bandwidths:
+            for P in chiplet_counts:
+                if P == 1:
+                    row = {
+                        "workload": wl.name, "m": wl.m, "n": wl.n, "k": wl.k,
+                        "num_chiplets": 1, "link_bw": bw,
+                        "best_strategy": "single", "speedup": 1.0, "efficiency": 1.0,
+                        "compute_cycles":    baseline.total_cycles,
+                        "distribute_cycles": 0, "reduce_cycles": 0,
+                        "total_cycles":      baseline.total_cycles,
+                        "baseline_cycles":   baseline.total_cycles,
+                        "compute_fraction":  1.0, "comm_fraction": 0.0,
+                    }
+                    with open(output_csv, "a", newline="") as f:
+                        csv.DictWriter(f, fieldnames=SCALING_FIELDS).writerow(row)
+                    continue
+
+                ic = Interconnect(P, topo, bw, link_latency)
+                results = evaluate_all_strategies(
+                    wl.m, wl.n, wl.k, array_h, array_w, dataflow, P, ic
+                )
+                best = results[0]
+                total = best.total_cycles_no_overlap
+                comm  = best.distribute.cycles + best.reduce.cycles
+                row = {
+                    "workload": wl.name, "m": wl.m, "n": wl.n, "k": wl.k,
+                    "num_chiplets":       P,
+                    "link_bw":            bw,
+                    "best_strategy":      best.strategy,
+                    "speedup":            best.speedup_no_overlap,
+                    "efficiency":         best.efficiency_no_overlap,
+                    "compute_cycles":     best.compute.total_cycles,
+                    "distribute_cycles":  best.distribute.cycles,
+                    "reduce_cycles":      best.reduce.cycles,
+                    "total_cycles":       total,
+                    "baseline_cycles":    baseline.total_cycles,
+                    "compute_fraction":   best.compute.total_cycles / total if total else 0,
+                    "comm_fraction":      comm / total if total else 0,
+                }
+                with open(output_csv, "a", newline="") as f:
+                    csv.DictWriter(f, fieldnames=SCALING_FIELDS).writerow(row)
+
+    log.info(f"Scaling sweep -> {output_csv}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Experiment 5: Compute model validation (analytical vs. SCALE-Sim)
+# ─────────────────────────────────────────────────────────────────────────────
+
+VALIDATION_CSV = "validation_results.csv"
+
+VALIDATION_FIELDS = [
+    "workload", "m", "n", "k",
+    "array_h", "array_w", "dataflow",
+    "sram_ifmap_kb", "sram_filter_kb", "sram_ofmap_kb", "dram_bandwidth",
+    "analytical_cycles", "scalesim_cycles",
+    "analytical_stalls", "scalesim_stalls",
+    "abs_error", "rel_error_pct",
+    "mapping_efficiency",
+]
+
+
+def run_validation_sweep(
+        array_sizes: list = None,
+        dataflows: list = None,
+        workloads: list = None,
+        sram_ifmap_kb: int = 6144,
+        sram_filter_kb: int = 6144,
+        sram_ofmap_kb: int = 2048,
+        dram_bandwidth: int = 10,
+        output_csv: str = VALIDATION_CSV):
+    """
+    Experiment 5: compare analytical cycle counts against SCALE-Sim for all
+    eight workloads across array sizes {16×16, 32×32, 64×64} and dataflows
+    {ws, os}.  Computes per-row absolute and relative error; MAPE is computed
+    in the plot function.
+
+    Falls back to the analytical model with SRAM stall modeling if SCALE-Sim
+    is not installed, so the CSV is always produced.
+    """
+    if array_sizes is None:
+        array_sizes = [(16, 16), (32, 32), (64, 64)]
+    if dataflows is None:
+        dataflows = ["ws", "os"]
+    if workloads is None:
+        workloads = VALIDATION_WORKLOADS
+
+    log = logging.getLogger(__name__)
+
+    with open(output_csv, "w", newline="") as f:
+        csv.DictWriter(f, fieldnames=VALIDATION_FIELDS).writeheader()
+
+    for wl in workloads:
+        for (ah, aw) in array_sizes:
+            for df in dataflows:
+                ana = analytical_compute(
+                    wl.m, wl.n, wl.k, ah, aw, df,
+                    sram_ifmap_kb=sram_ifmap_kb,
+                    sram_filter_kb=sram_filter_kb,
+                    sram_ofmap_kb=sram_ofmap_kb,
+                    dram_bandwidth=float(dram_bandwidth),
+                )
+                sim = scalesim_compute(
+                    wl.m, wl.n, wl.k, ah, aw, df,
+                    sram_ifmap_kb=sram_ifmap_kb,
+                    sram_filter_kb=sram_filter_kb,
+                    sram_ofmap_kb=sram_ofmap_kb,
+                    bandwidth=dram_bandwidth,
+                )
+                abs_err = abs(ana.total_cycles - sim.total_cycles)
+                rel_err = 100.0 * abs_err / sim.total_cycles if sim.total_cycles else 0.0
+
+                row = {
+                    "workload":           wl.name,
+                    "m": wl.m, "n": wl.n, "k": wl.k,
+                    "array_h":            ah,
+                    "array_w":            aw,
+                    "dataflow":           df,
+                    "sram_ifmap_kb":      sram_ifmap_kb,
+                    "sram_filter_kb":     sram_filter_kb,
+                    "sram_ofmap_kb":      sram_ofmap_kb,
+                    "dram_bandwidth":     dram_bandwidth,
+                    "analytical_cycles":  ana.total_cycles,
+                    "scalesim_cycles":    sim.total_cycles,
+                    "analytical_stalls":  ana.stall_cycles,
+                    "scalesim_stalls":    sim.stall_cycles,
+                    "abs_error":          abs_err,
+                    "rel_error_pct":      round(rel_err, 3),
+                    "mapping_efficiency": round(ana.mapping_efficiency, 4),
+                }
+                with open(output_csv, "a", newline="") as f:
+                    csv.DictWriter(f, fieldnames=VALIDATION_FIELDS).writerow(row)
+                log.info(f"{wl.name} {ah}×{aw} {df}: "
+                         f"ana={ana.total_cycles:,}  sim={sim.total_cycles:,}  "
+                         f"err={rel_err:.1f}%")
+
+    log.info(f"Validation sweep -> {output_csv}")
